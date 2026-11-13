@@ -376,13 +376,28 @@ def run_and_save_sweep_swmr(sweep: Sweep,
         logger.info('The measurement has finished successfully and all of the data has been saved.')
         return dir, None
 
-    broadcast_first = _broadcast_line(first_line)
-    for fname, arr in broadcast_first.items():
-        if fname in structure:
-            inner = arr.shape[1:]
-            if inner:
-                structure[fname]['shape'] = inner
-            structure[fname]['dtype'] = arr.dtype
+    # Find the first line without None values for dtype inference.
+    # If the initial first_line contains None, fast-forward past it (and any
+    # subsequent None-containing lines) so that structure dtypes are inferred
+    # from actual data, never from the np.nan placeholder.
+    dtype_line = first_line
+    if _check_none(first_line, all=ignore_all_None_results):
+        dtype_line = None
+        for line in sweep_iter:
+            if not _check_none(line, all=ignore_all_None_results):
+                dtype_line = line
+                break
+
+    if dtype_line is not None:
+        broadcast_first = _broadcast_line(dtype_line)
+        for fname, arr in broadcast_first.items():
+            if fname in structure:
+                inner = arr.shape[1:]
+                if inner:
+                    structure[fname]['shape'] = inner
+                structure[fname]['dtype'] = arr.dtype
+    else:
+        broadcast_first = None
 
     try:
         with DDH5Writer_swmr(structure, basedir=data_dir, name=name, chunk_size=chunk_size) as writer:
@@ -471,4 +486,3 @@ def run_and_save_sweep_swmr(sweep: Sweep,
     if return_data:
         return dir, ddh5_to_xarray(writer.filepath)
     return dir, None
-
