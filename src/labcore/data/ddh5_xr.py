@@ -88,13 +88,28 @@ class DDH5SWMRReader:
     timeout : float, optional
         Maximum time (seconds) to wait for the file to appear / become
         accessible.  Default: 30 s.
+
+    Notes
+    -----
+    Set the class attribute :attr:`file_locking` to ``False`` to open files
+    without HDF5 file locking. On Windows, the lock a reader takes makes a
+    concurrent :class:`DDH5Writer_swmr` fail its writes ("Permission
+    denied") and crash, so live viewers should disable it. ``None`` keeps
+    the HDF5 default.
     """
+
+    file_locking: Optional[bool] = None
 
     def __init__(self, path: Union[str, Path], timeout: float = 30.0):
         self._path = Path(path)
         self._timeout = timeout
         self._h5: Optional[h5py.File] = None
         self.swmr_active: bool = False
+
+    def _open(self, **kwargs: Any) -> h5py.File:
+        if self.file_locking is not None:
+            kwargs["locking"] = self.file_locking
+        return h5py.File(str(self._path), "r", libver="latest", **kwargs)
 
     def __enter__(self) -> h5py.File:
         t0 = time.time()
@@ -108,21 +123,19 @@ class DDH5SWMRReader:
                 continue
 
             try:
-                self._h5 = h5py.File(
-                    str(self._path), "r", swmr=True, libver="latest"
-                )
+                self._h5 = self._open(swmr=True)
                 self.swmr_active = True
                 return self._h5
             except Exception:
                 pass
 
             try:
-                self._h5 = h5py.File(
-                    str(self._path), "r", libver="latest"
-                )
+                self._h5 = self._open()
                 self.swmr_active = False
                 return self._h5
-            except Exception:
+            except Exception as exc:
+                if _is_corrupt_file_error(exc, self._path):
+                    raise
                 if time.time() - t0 > self._timeout:
                     raise
                 time.sleep(0.1)
@@ -131,6 +144,16 @@ class DDH5SWMRReader:
         if self._h5 is not None:
             self._h5.close()
             self._h5 = None
+
+
+def _is_corrupt_file_error(exc: Exception, path: Path) -> bool:
+    """True if *exc* means the file is not HDF5 at all (retrying won't help)."""
+    if "signature" not in str(exc).lower():
+        return False
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def timestamp_from_path(p: Path) -> datetime.datetime:
@@ -155,7 +178,11 @@ def find_data(
     for f, dirs, files in os.walk(root):
         if "data.ddh5" in files:
             fp = Path(f)
-            ts = timestamp_from_path(fp)
+            try:
+                ts = timestamp_from_path(fp)
+            except ValueError:
+                logger.warning("Skipping %s: folder name has no timestamp", fp)
+                continue
             if newer_than is not None and ts <= newer_than:
                 continue
             if older_than is not None and ts >= older_than:
@@ -447,77 +474,85 @@ def ddh5_schema(
         if groupname not in f:
             raise ValueError(f"HDF5 group '{groupname}' not found in {filepath}")
 
-        grp = f[groupname]
-        keys = list(grp.keys())
+        return _schema_from_group(f[groupname])
 
-        if not keys:
-            nrecords = 0
+
+def _schema_from_group(grp: h5py.Group) -> DDH5Schema:
+    """Build a :class:`DDH5Schema` from an already-open HDF5 group.
+
+    Lets callers that already hold the file open avoid a second open
+    (and the lock-file wait that comes with :class:`FileOpener`).
+    """
+    keys = list(grp.keys())
+
+    if not keys:
+        nrecords = 0
+    else:
+        nrecords = grp[keys[0]].shape[0]
+
+    fields: Dict[str, DDH5FieldInfo] = {}
+    meta: Dict[str, Any] = {}
+
+    for attr_name in grp.attrs:
+        meta[attr_name] = deh5ify(grp.attrs[attr_name])
+
+    for k in keys:
+        ds = grp[k]
+        try:
+            shp = ds.shape
+        except Exception:
+            shp = (0,)
+        try:
+            dtype = ds.dtype
+        except Exception:
+            dtype = np.dtype("float64")
+
+        raw_axes = ds.attrs.get("axes", None)
+        if raw_axes is not None:
+            axes_val = deh5ify(raw_axes)
+            if isinstance(axes_val, (np.ndarray,)):
+                axes_val = axes_val.tolist()
+            if isinstance(axes_val, str):
+                axes_val = [axes_val]
+            axes = list(axes_val) if axes_val else []
         else:
-            nrecords = grp[keys[0]].shape[0]
+            axes = []
 
-        fields: Dict[str, DDH5FieldInfo] = {}
-        meta: Dict[str, Any] = {}
+        unit_raw = ds.attrs.get("unit", "")
+        unit = deh5ify(unit_raw) if unit_raw else ""
+        if isinstance(unit, bytes):
+            unit = unit.decode("utf-8", errors="replace")
+        unit = str(unit) if unit else ""
 
-        for attr_name in grp.attrs:
-            meta[attr_name] = deh5ify(grp.attrs[attr_name])
+        label = k
+        for attr_name in ds.attrs:
+            cleaned = str(attr_name).strip("_")
+            if cleaned == "label":
+                lv = deh5ify(ds.attrs[attr_name])
+                if isinstance(lv, bytes):
+                    lv = lv.decode("utf-8", errors="replace")
+                if lv and str(lv):
+                    label = str(lv)
+                break
 
-        for k in keys:
-            ds = grp[k]
-            try:
-                shp = ds.shape
-            except Exception:
-                shp = (0,)
-            try:
-                dtype = ds.dtype
-            except Exception:
-                dtype = np.dtype("float64")
+        fields[k] = DDH5FieldInfo(
+            name=k,
+            shape=shp,
+            dtype=np.dtype(dtype),
+            axes=axes,
+            unit=str(unit),
+            label=str(label),
+        )
 
-            raw_axes = ds.attrs.get("axes", None)
-            if raw_axes is not None:
-                axes_val = deh5ify(raw_axes)
-                if isinstance(axes_val, (np.ndarray,)):
-                    axes_val = axes_val.tolist()
-                if isinstance(axes_val, str):
-                    axes_val = [axes_val]
-                axes = list(axes_val) if axes_val else []
-            else:
-                axes = []
+    # A field is independent if it is referenced as an axis by ANY field,
+    # or if it has no axes of its own.
+    # A field is dependent only if it has axes and is NOT used as an axis.
+    all_axes: set = set()
+    for fi in fields.values():
+        all_axes.update(fi.axes)
 
-            unit_raw = ds.attrs.get("unit", "")
-            unit = deh5ify(unit_raw) if unit_raw else ""
-            if isinstance(unit, bytes):
-                unit = unit.decode("utf-8", errors="replace")
-            unit = str(unit) if unit else ""
-
-            label = k
-            for attr_name in ds.attrs:
-                cleaned = str(attr_name).strip("_")
-                if cleaned == "label":
-                    lv = deh5ify(ds.attrs[attr_name])
-                    if isinstance(lv, bytes):
-                        lv = lv.decode("utf-8", errors="replace")
-                    if lv and str(lv):
-                        label = str(lv)
-                    break
-
-            fields[k] = DDH5FieldInfo(
-                name=k,
-                shape=shp,
-                dtype=np.dtype(dtype),
-                axes=axes,
-                unit=str(unit),
-                label=str(label),
-            )
-
-        # A field is independent if it is referenced as an axis by ANY field,
-        # or if it has no axes of its own.
-        # A field is dependent only if it has axes and is NOT used as an axis.
-        all_axes: set = set()
-        for fi in fields.values():
-            all_axes.update(fi.axes)
-
-        deps = [n for n, fi in fields.items() if fi.axes and n not in all_axes]
-        indeps = [n for n, fi in fields.items() if n in all_axes or not fi.axes]
+    deps = [n for n, fi in fields.items() if fi.axes and n not in all_axes]
+    indeps = [n for n, fi in fields.items() if n in all_axes or not fi.axes]
 
     return DDH5Schema(
         fields=fields,
@@ -1128,9 +1163,7 @@ def ddh5_to_xarray(
 
         grp = f[groupname]
 
-        schemas = ddh5_schema(
-            filepath, groupname=groupname, file_timeout=file_timeout, swmr=False
-        )
+        schemas = _schema_from_group(grp)
 
         if fields is not None:
             schemas = schemas.select(fields)
@@ -1248,9 +1281,7 @@ def ddh5_to_gridded_ddh5(
 
         grp = f[groupname]
 
-        schemas = ddh5_schema(
-            filepath, groupname=groupname, file_timeout=file_timeout, swmr=False
-        )
+        schemas = _schema_from_group(grp)
         grid_info = _infer_grid(grp, schemas, missing)
 
         all_fields: Dict[str, np.ndarray] = {}
